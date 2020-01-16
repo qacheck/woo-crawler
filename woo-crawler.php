@@ -47,6 +47,7 @@ class Woo_Crawler {
 
 	public function include() {
 		require_once WOOCRL_PATH . '/simplehtmldom/simple_html_dom.php';
+		require_once WOOCRL_PATH . '/arraytocsv.php';
 	}
 
 	public function activate() {
@@ -93,6 +94,9 @@ class Woo_Crawler {
 
 	public function woocrl_remove_crawled() {
 		echo delete_option( 'woocrl_crawled' );
+		echo delete_option( 'woocrl_products' );
+		$ua = isset($_REQUEST['ua']) ? $_REQUEST['ua'] : 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/79.0.3945.117 Safari/537.36';
+		update_option( 'woocrl_ua', $ua );
 		die;
 	}
 
@@ -113,8 +117,10 @@ class Woo_Crawler {
 			
 			update_option( 'woocrl_su', $su );
 			
+			$ua = get_option('woocrl_ua', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/79.0.3945.117 Safari/537.36');
 			// lấy danh sách url đã quét
 			$crawled = get_option( 'woocrl_crawled', array() );
+			$products = get_option( 'woocrl_products', array() );
 
 			// đưa url vào đanh sách đã quét
 			$crawled[] = $su;
@@ -122,7 +128,8 @@ class Woo_Crawler {
 			// khởi tạo danh sách quét mới
 			$next_crawl = array();
 
-			$html = file_get_html($su);
+			$source = wp_remote_retrieve_body(wp_remote_get( $su, array( 'user-agent' => $ua ) ));
+			$html = str_get_html($source);
 
 			$return['crawled_url'] = $su;
 
@@ -132,11 +139,14 @@ class Woo_Crawler {
 				$product_page = $html->find('body.woocommerce.single-product',0);
 				if( $product_page ) {
 					$div_product = $product_page->find('.product.type-product',0);
-					if( $div_product ) {
+					if( $div_product && !$div_product->hasClass('product-type-grouped') ) {
 						$product = array();
 
 						$product['slug'] = end(explode('/', $su));
-						$product['title'] = $div_product->find('.product_title.entry-title',0)->plaintext;
+						
+						$html_title = $div_product->find('.product_title.entry-title',0);
+						
+						$product['title'] = ($html_title)?trim($html_title->plaintext):'';
 
 						$product['type'] = '';
 
@@ -147,26 +157,45 @@ class Woo_Crawler {
 						} else if( $div_product->hasClass('product-type-external') ) {
 							$product['type'] = 'external';
 						}
+
 						// else if( $div_product->hasClass('product-type-grouped') ) {
 						// 	$product['type'] = 'grouped';
 						// }
 
 						$product_price = $div_product->find('p.price',0);
 
+						$product['regular_price'] = null;
+						$product['sale_price'] = null;
+
 						switch ($product['type']) {
 							case 'simple':
 							case 'external':
 								if( $div_product->hasClass('sale') ) {
 									$product['sale'] = true;
-									$product['regular_price'] = preg_replace('/\D/','',$product_price->find('del .woocommerce-Price-amount.amount',0)->plaintext);
-									$product['sale_price'] = preg_replace('/\D/','',$product_price->find('ins .woocommerce-Price-amount.amount',0)->plaintext);
+									if($product_price) {
+										$regular_price = $product_price->find('del .woocommerce-Price-amount.amount',0);
+										if($regular_price) {
+											$product['regular_price'] = preg_replace('/[^\d\.]/','',$regular_price->plaintext);
+										}
+
+										$sale_price = $product_price->find('ins .woocommerce-Price-amount.amount',0);
+										if($sale_price) {
+											$product['sale_price'] = preg_replace('/[^\d\.]/','',$sale_price->plaintext);
+										}
+									}
 									
 								} else {
 									$product['sale'] = false;
-									$product['regular_price'] = preg_replace('/\D/','',$product_price->find('.woocommerce-Price-amount.amount',0)->plaintext);
+									$regular_price = $product_price->find('.woocommerce-Price-amount.amount',0);
+									if($regular_price) {
+										$product['regular_price'] = preg_replace('/[^\d\.]/','',$regular_price->plaintext);
+									}
 								}
 
-								$product['currency_symbol'] = $product_price->find('.woocommerce-Price-currencySymbol',0)->plaintext;
+								$currency_symbol = $product_price->find('.woocommerce-Price-currencySymbol',0);
+
+								$product['currency_symbol'] = ($currency_symbol)?trim($currency_symbol->plaintext):'';
+
 								break;
 
 							case 'variable':
@@ -174,8 +203,16 @@ class Woo_Crawler {
 								break;
 						}
 						
-						$product['excerpt'] = $div_product->find('.woocommerce-product-details__short-description',0)->innertext();
-						$product['content'] = $div_product->find('.woocommerce-Tabs-panel .woocommerce-Tabs-panel--description',0)->innertext();
+						$excerpt = $div_product->find('.woocommerce-product-details__short-description',0);
+
+						$product['excerpt'] = ($excerpt)?trim($excerpt->innertext()):'';
+
+						$content = $div_product->find('#tab-description',0);
+						$product['content'] = ($content)?trim($content->innertext()):'';
+
+						$products[] = $product;
+
+						update_option( 'woocrl_products', $products );
 					}
 				}
 
@@ -192,28 +229,30 @@ class Woo_Crawler {
 							if($href_parser['host']==$su_parser['host']) {
 								$get_href = esc_url_raw($href);
 							}
-						} else {
-							if( isset($href_parser['scheme']) && $href_parser['scheme']!='http' && $href_parser['scheme']!='https' ){
-								$get_href = '';
-							} else {
-								if ( preg_match('/^\/[^\/]+.*/', $href) ) {
-									$get_href = $su_parser['host'].'/'.ltrim($href,'/');
-								} else if ( preg_match('/^\/\/[^\/]+.*/', $href) ) {
-									$get_href = 'http:'.$href;
-								} else if ( preg_match('/[^\:]*\:[^\:]*/', $href) ) {
-									$get_href = '';
-								} else if (  preg_match('/^\#/', $href)  ) {
-									$get_href = '';
-								} else {
-									$get_href = $su.'/'.ltrim($href,'/');
-								}
-							}
-						
 						}
+
+						// else {
+						// 	if( isset($href_parser['scheme']) && $href_parser['scheme']!='http' && $href_parser['scheme']!='https' ){
+						// 		$get_href = '';
+						// 	} else {
+						// 		if ( preg_match('/^\/[^\/]+.*/', $href) ) {
+						// 			$get_href = $su_parser['host'].'/'.ltrim($href,'/');
+						// 		} else if ( preg_match('/^\/\/[^\/]+.*/', $href) ) {
+						// 			$get_href = 'http:'.$href;
+						// 		} else if ( preg_match('/[^\:]*\:[^\:]*/', $href) ) {
+						// 			$get_href = '';
+						// 		} else if (  preg_match('/^\#/', $href)  ) {
+						// 			$get_href = '';
+						// 		} else {
+						// 			$get_href = $su.'/'.ltrim($href,'/');
+						// 		}
+						// 	}
+						
+						// }
 
 						if( $get_href != '' ) {
 							$temp = explode('?', $get_href);
-							//$temp = explode('#', $temp[0]);
+							$temp = explode('#', $temp[0]);
 							$get_href = esc_url_raw( untrailingslashit($temp[0]) );
 						}
 
